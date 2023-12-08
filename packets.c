@@ -7,12 +7,11 @@
 #include <assert.h>
 #include <unistd.h>
 #include <stdbool.h>
-#include <sys/poll.h>
-#include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <netinet/tcp.h>
+#include <x68k/dos.h>
+#include <x68k/iocs.h>
 #include "packets.h"
+
+extern int debuglevel;
 
 struct packet_buf
 {
@@ -59,63 +58,25 @@ void pktbuf_clear(struct packet_buf *pkt)
     pkt->end = 0;
 }
 
-static bool poll_socket(int sock_fd, short events)
-{
-    struct pollfd pfd;
-    memset(&pfd, 0, sizeof(pfd));
-    pfd.fd = sock_fd;
-    pfd.events = events;
-
-    int ret = poll(&pfd, 1, -1);
-    if (ret < 0)
-    {
-        perror("poll() failed");
-        exit(-1);
-    }
-    return ret > 0;
-}
-
-static bool poll_incoming(int sock_fd)
-{
-    return poll_socket(sock_fd, POLLIN);
-}
-
-static void poll_outgoing(int sock_fd)
-{
-    poll_socket(sock_fd, POLLOUT);
-}
-
-void read_data_once()
-{
-    int ret;
-    ssize_t nread;
-    uint8_t buf[4096];
-
-    poll_incoming(sock_fd);
-    nread = read(sock_fd, buf, sizeof(buf));
-    if (nread <= 0)
-    {
-        puts("Connection closed");
-        exit(0);
-    }
-    pktbuf_insert(&in, buf, nread);
-}
-
 void write_flush()
 {
     size_t write_index = 0;
+
+    if (debuglevel > 1)
+        printf("\x1b[31m");
+
     while (write_index < out.end)
     {
-        ssize_t nwritten;
-        poll_outgoing(sock_fd);
-        nwritten = write(sock_fd, out.buf + write_index, out.end - write_index);
-        if (nwritten < 0)
-        {
-            printf("Write error\n");
-            exit(-2);
-        }
-        write_index += nwritten;
+        while (_iocs_osns232c() == 0)
+            ;
+        if (debuglevel > 1)
+            putchar(out.buf[write_index]);
+        _iocs_out232c(out.buf[write_index++]);
     }
+
+    if (debuglevel > 1)
+        printf("\x1b[m\n");
+
     pktbuf_clear(&out);
 }
 
@@ -183,165 +144,49 @@ void write_binary_packet(const char *pfx, const uint8_t *data, ssize_t num_bytes
     free(buf);
 }
 
-bool skip_to_packet_start()
+static int inp232c(void)
 {
-    ssize_t end = -1;
-    for (size_t i = 0; i < in.end; ++i)
-        if (in.buf[i] == '$' || in.buf[i] == INTERRUPT_CHAR)
-        {
-            end = i;
-            break;
-        }
+    while (_iocs_isns232c() == 0)
+        ;
+    int c = _iocs_inp232c() & 0xff;
 
-    if (end < 0)
+    if (debuglevel > 1)
     {
-        pktbuf_clear(&in);
-        return false;
+        if (c < ' ')
+            printf("{%02X}", c);
+          else
+            printf("%c", c);
     }
 
-    pktbuf_erase_head(&in, end);
-    assert(1 <= in.end);
-    assert('$' == in.buf[0] || INTERRUPT_CHAR == in.buf[0]);
-    return true;
+    return c;
 }
 
 void read_packet()
 {
-    while (!skip_to_packet_start())
-        read_data_once();
+    uint8_t c;
+    pktbuf_clear(&in);
+    do {
+        c = inp232c();
+    } while (c != '$' && c != INTERRUPT_CHAR);
+
+    pktbuf_insert(&in, &c, 1);
+    do {
+        c = inp232c();
+        pktbuf_insert(&in, &c, 1);
+    } while (c != '#');
+    c = inp232c();
+    pktbuf_insert(&in, &c, 1);
+    c = inp232c();
+    pktbuf_insert(&in, &c, 1);
+
     write_data_raw((uint8_t *)"+", 1);
     write_flush();
 }
 
-static int async_io_enabled;
-void (*request_interrupt)(void);
-
-static void enable_async_notification(int fd)
-{
-#if defined(F_SETFL) && defined(FASYNC)
-    int save_fcntl_flags;
-
-    save_fcntl_flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, save_fcntl_flags | FASYNC);
-#if defined(F_SETOWN)
-    fcntl(fd, F_SETOWN, getpid());
-#endif
-#endif
-}
-
-static void input_interrupt(int unused)
-{
-    if (async_io_enabled)
-    {
-        int nread;
-        char buf;
-        nread = read(sock_fd, &buf, 1);
-        assert(nread == 1 && buf == INTERRUPT_CHAR);
-        request_interrupt();
-    }
-}
-
-static void block_unblock_async_io(int block)
-{
-    sigset_t sigio_set;
-    sigemptyset(&sigio_set);
-    sigaddset(&sigio_set, SIGIO);
-    sigprocmask(block ? SIG_BLOCK : SIG_UNBLOCK, &sigio_set, NULL);
-}
-
-void enable_async_io(void)
-{
-    if (async_io_enabled)
-        return;
-    block_unblock_async_io(0);
-    async_io_enabled = 1;
-}
-
-void disable_async_io(void)
-{
-    if (!async_io_enabled)
-        return;
-    block_unblock_async_io(1);
-    async_io_enabled = 0;
-}
-
-void initialize_async_io(void (*intr_func)(void))
-{
-    request_interrupt = intr_func;
-    async_io_enabled = 1;
-    disable_async_io();
-    signal(SIGIO, input_interrupt);
-}
-
 void remote_prepare(char *name)
 {
-    int ret;
-    char *port_str;
-    int port;
-    struct sockaddr_in addr;
-    char *port_end;
-    const int one = 1;
-    int listen_fd;
+    int bdset = 9;    // 38400
 
-    port_str = strchr(name, ':');
-    if (port_str == NULL)
-        return;
-    *port_str = '\0';
-
-    port = strtoul(port_str + 1, &port_end, 10);
-    if (port_str[1] == '\0' || *port_end != '\0')
-        printf("Bad port argument: %s", name);
-
-    listen_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, IPPROTO_TCP);
-    if (listen_fd < 0)
-    {
-        perror("socket() failed");
-        exit(-1);
-    }
-
-    ret = setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    if (ret < 0)
-    {
-        perror("setsockopt() failed");
-        exit(-1);
-    }
-
-    printf("Listening on port %d\n", port);
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = *name ? inet_addr(name) : INADDR_ANY;
-    addr.sin_port = htons(port);
-
-    if (addr.sin_addr.s_addr == INADDR_NONE)
-    {
-        printf("Bad host argument: %s", name);
-        exit(-1);
-    }
-
-    ret = bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
-    if (ret < 0)
-    {
-        perror("bind() failed");
-        exit(-1);
-    }
-
-    ret = listen(listen_fd, 1);
-    if (ret < 0)
-    {
-        perror("listen() failed");
-        exit(-1);
-    }
-
-    sock_fd = accept(listen_fd, NULL, NULL);
-    if (sock_fd < 0)
-    {
-        perror("accept() failed");
-        exit(-1);
-    }
-
-    ret = setsockopt(sock_fd, SOL_SOCKET, SO_KEEPALIVE, &one, sizeof(one));
-    ret = setsockopt(sock_fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-    enable_async_notification(sock_fd);
-    close(listen_fd);
-    pktbuf_clear(&in);
-    pktbuf_clear(&out);
+    // stop 1 / nonparity / 8bit / nonxoff
+    _iocs_set232c(0x4c00 | bdset);
 }

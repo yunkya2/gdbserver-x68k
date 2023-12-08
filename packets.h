@@ -14,9 +14,6 @@ void write_flush();
 void write_packet(const char *data);
 void write_binary_packet(const char *pfx, const uint8_t *data, ssize_t num_bytes);
 void read_packet();
-void enable_async_io(void);
-void disable_async_io(void);
-void initialize_async_io(void (*intr_func)(void));
 void remote_prepare(char *name);
 
 #endif /* PACKETS_H */
