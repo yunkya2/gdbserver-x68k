@@ -183,9 +183,21 @@ void read_packet()
     write_flush();
 }
 
-void remote_prepare(char *name)
+void remote_prepare(char *speed)
 {
-    int bdset = 9;    // 38400
+    static const int bauddef[] = { 75, 150, 300, 600, 1200, 2400, 4800, 9600, 19200, 38400 };
+    int bdset = -1;
+    int baudrate = atoi(speed);
+
+    for (int i = 0; i < sizeof(bauddef) / sizeof(bauddef[0]); i++) {
+        if (baudrate == bauddef[i]) {
+            printf("Serial speed:%dbps\n", baudrate);
+            bdset = i;
+            break;
+        }
+    }
+    if (bdset < 0)
+        bdset = 9;      // 38400
 
     // stop 1 / nonparity / 8bit / nonxoff
     _iocs_set232c(0x4c00 | bdset);

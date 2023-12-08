@@ -391,20 +391,34 @@ extern struct dos_comline *_cmdline;
 static const char *target = NULL;
 static struct dos_comline target_cmdline;
 
+static void help(char *argv[])
+{
+  printf(
+    "Usage: %s [<options>] <target> [<target args>..]\n"
+    "Options:\n"
+    "-s<speed> : set serial speed\n"
+    "-D        : increase debug level\n"
+    , argv[0]);
+  exit(1);
+}
+
 int main(int argc, char *argv[])
 {
   int ac;
-  int help = false;
+  char *speed = "";
 
   for (ac = 1; ac < argc; ac++) {
     if (argv[ac][0] == '-') {
       /* command option */
       switch (argv[ac][1]) {
+      case 's':
+        speed = &argv[ac][2];
+        break;
       case 'D':
         debuglevel++;
         break;
       default:
-        help = true;
+        help(argv);
       }
     } else {
       target = argv[ac];
@@ -412,10 +426,8 @@ int main(int argc, char *argv[])
     }
   }
 
-  if (target == NULL || help) {
-    printf("Usage: %s [options] <target> [target args..]\n", argv[0]);
-    exit(1);
-  }
+  if (target == NULL)
+    help(argv);
 
   int p;
   bool f = false;
@@ -436,7 +448,7 @@ int main(int argc, char *argv[])
   memset(target_cmdline.buffer, 0, sizeof(target_cmdline.buffer));
   memcpy(target_cmdline.buffer, &_cmdline->buffer[p], target_cmdline.len);
 
-  remote_prepare(NULL);
+  remote_prepare(speed);
 
   _iocs_b_super(0);
   target_offset = target_load(target, &target_cmdline, NULL);
