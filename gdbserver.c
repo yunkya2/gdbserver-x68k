@@ -1,40 +1,19 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <signal.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <errno.h>
-#include <dirent.h>
 #include <assert.h>
 #include <stdbool.h>
-#include <sys/wait.h>
-#include <sys/user.h>
-#include <sys/ptrace.h>
-#include <sys/syscall.h>
-
 #include "arch.h"
 #include "utils.h"
 #include "packets.h"
-#include "gdb_signals.h"
+#include "ptrace.h"
+#include <x68k/dos.h>
+#include <x68k/iocs.h>
 
-size_t *entry_stack_ptr;
-
-#define THREAD_NUMBER 64
-
-struct thread_id_t
-{
-  pid_t pid;
-  pid_t tid;
-  int stat;
-};
-
-struct thread_list_t
-{
-  struct thread_id_t t[THREAD_NUMBER];
-  struct thread_id_t *curr;
-  int len;
-} threads;
+uint32_t target_offset;
+bool terminate = false;
+int debuglevel = 0;
 
 #define BREAKPOINT_NUMBER 64
 
@@ -47,157 +26,16 @@ struct debug_breakpoint_t
 uint8_t tmpbuf[0x20000];
 bool attach = false;
 
-void sigint_pid()
-{
-  kill(-threads.t[0].pid, SIGINT);
-}
+char msgbuf[256];
 
-bool is_clone_event(int status)
+void prepare_resume_reply(uint8_t *buf, bool cont, int result, int exitcode)
 {
-  return (status >> 8 == (SIGTRAP | (PTRACE_EVENT_CLONE << 8)));
-}
-
-bool check_exit()
-{
-  if (WIFEXITED(threads.curr->stat) && threads.len > 1)
-  {
-    threads.curr->pid = 0;
-    threads.curr->tid = 0;
-    threads.curr = NULL;
-    threads.len--;
-    return true;
+  if (result < 0) {
+    sprintf(buf, "W%02x", exitcode);
+    terminate = true;
+  } else {
+    sprintf(buf, "S%02x", exitcode);
   }
-  return false;
-}
-
-void check_sigtrap()
-{
-  siginfo_t info;
-  ptrace(PTRACE_GETSIGINFO, threads.curr->tid, NULL, &info);
-  if (info.si_code == SI_KERNEL && info.si_signo == SIGTRAP)
-  {
-    size_t pc = ptrace(PTRACE_PEEKUSER, threads.curr->tid, SZ * PC, NULL);
-    pc -= sizeof(break_instr);
-    for (int i = 0; i < BREAKPOINT_NUMBER; i++)
-      if (breakpoints[i].addr == pc)
-      {
-        ptrace(PTRACE_POKEUSER, threads.curr->tid, SZ * PC, pc);
-        break;
-      }
-  }
-}
-
-bool check_sigstop()
-{
-  siginfo_t info;
-  ptrace(PTRACE_GETSIGINFO, threads.curr->tid, NULL, &info);
-  if (info.si_code == SI_TKILL && info.si_signo == SIGSTOP)
-  {
-    ptrace(PTRACE_CONT, threads.curr->tid, NULL, NULL);
-    return true;
-  }
-  return false;
-}
-
-bool check_clone()
-{
-  if (is_clone_event(threads.curr->stat))
-  {
-    size_t newtid;
-    int stat;
-    ptrace(PTRACE_GETEVENTMSG, threads.curr->tid, NULL, (long)&newtid);
-    if (waitpid(newtid, &stat, __WALL) > 0)
-    {
-      for (int i = 0; i < THREAD_NUMBER; i++)
-        if (!threads.t[i].tid)
-        {
-          threads.t[i].pid = threads.curr->pid;
-          threads.t[i].tid = newtid;
-          threads.len++;
-          break;
-        }
-      ptrace(PTRACE_CONT, newtid, NULL, NULL);
-    }
-    ptrace(PTRACE_CONT, threads.curr->tid, NULL, NULL);
-    return true;
-  }
-  return false;
-}
-
-void set_curr_thread(pid_t tid)
-{
-  for (int i = 0; i < THREAD_NUMBER; i++)
-    if (threads.t[i].tid == tid)
-    {
-      threads.curr = &threads.t[i];
-      break;
-    }
-}
-
-void stop_threads()
-{
-  struct thread_id_t *cthread = threads.curr;
-  for (int i = 0, n = 0; i < THREAD_NUMBER && n < threads.len - 1; i++)
-    if (threads.t[i].pid && threads.t[i].tid != cthread->tid)
-      do
-      {
-        threads.curr = &threads.t[i];
-        if (syscall(SYS_tgkill, threads.curr->pid, threads.curr->tid, SIGSTOP) == -1)
-          printf("Failed to stop thread %d\n", threads.curr->tid);
-        waitpid(threads.curr->tid, &threads.curr->stat, __WALL);
-        check_exit();
-        check_sigtrap();
-      } while (check_clone());
-  threads.curr = cthread;
-}
-
-size_t init_tids(const pid_t pid)
-{
-  char dirname[64];
-  DIR *dir;
-  struct dirent *ent;
-  int i = 0;
-
-  snprintf(dirname, sizeof dirname, "/proc/%d/task/", (int)pid);
-  dir = opendir(dirname);
-  if (!dir)
-    perror("opendir()");
-  while ((ent = readdir(dir)) != NULL)
-  {
-    if (ent->d_name[0] == '.')
-      continue;
-    threads.t[i].pid = pid;
-    threads.t[i].tid = atoi(ent->d_name);
-    threads.len++;
-    i++;
-  }
-  closedir(dir);
-}
-
-void prepare_resume_reply(uint8_t *buf, bool cont)
-{
-  if (WIFEXITED(threads.curr->stat))
-    sprintf(buf, "W%02x", gdb_signal_from_host(WEXITSTATUS(threads.curr->stat)));
-  if (WIFSTOPPED(threads.curr->stat))
-  {
-    if (cont)
-      stop_threads();
-    sprintf(buf, "T%02xthread:p%02x.%02x;", gdb_signal_from_host(WSTOPSIG(threads.curr->stat)), threads.curr->pid, threads.curr->tid);
-  }
-  // if (WIFSIGNALED(stat_loc))
-  //   sprintf(buf, "T%02x", gdb_signal_from_host(WTERMSIG(stat_loc)));
-}
-
-void read_auxv(void)
-{
-  uint8_t proc_auxv_path[20];
-  FILE *fp;
-  int ret;
-  sprintf(proc_auxv_path, "/proc/%d/auxv", threads.t[0].pid);
-  fp = fopen(proc_auxv_path, "r");
-  ret = fread(tmpbuf, 1, sizeof(tmpbuf), fp);
-  fclose(fp);
-  write_binary_packet("l", tmpbuf, ret);
 }
 
 void process_xfer(const char *name, char *args)
@@ -207,15 +45,6 @@ void process_xfer(const char *name, char *args)
   *args++ = '\0';
   if (!strcmp(name, "features") && !strcmp(mode, "read"))
     write_packet(FEATURE_STR);
-  if (!strcmp(name, "auxv") && !strcmp(mode, "read"))
-    read_auxv();
-  if (!strcmp(name, "exec-file") && !strcmp(mode, "read"))
-  {
-    uint8_t proc_exe_path[20], file_path[256] = {'l'};
-    sprintf(proc_exe_path, "/proc/%d/exe", threads.t[0].pid);
-    realpath(proc_exe_path, file_path + 1);
-    write_packet(file_path);
-  }
 }
 
 void process_query(char *payload)
@@ -229,7 +58,7 @@ void process_query(char *payload)
   name = payload;
   if (!strcmp(name, "C"))
   {
-    snprintf(tmpbuf, sizeof(tmpbuf), "QCp%02x.%02x", threads.curr->pid, threads.curr->tid);
+    snprintf(tmpbuf, sizeof(tmpbuf), "QCp%02x.%02x", 1, 1);
     write_packet(tmpbuf);
   }
   if (!strcmp(name, "Attached"))
@@ -240,9 +69,13 @@ void process_query(char *payload)
       write_packet("0");
   }
   if (!strcmp(name, "Offsets"))
-    write_packet("");
+  {
+    snprintf(tmpbuf, sizeof(tmpbuf), "Text=%x;Data=%x;Bss=%x",
+             target_offset, target_offset, target_offset);
+    write_packet(tmpbuf);
+  }
   if (!strcmp(name, "Supported"))
-    write_packet("PacketSize=8000;qXfer:features:read+;qXfer:auxv:read+;qXfer:exec-file:read+;multiprocess+");
+    write_packet("PacketSize=8000;qXfer:features:read+");
   if (!strcmp(name, "Symbol"))
     write_packet("OK");
   if (name == strstr(name, "ThreadExtraInfo"))
@@ -262,54 +95,27 @@ void process_query(char *payload)
   }
   if (!strcmp(name, "fThreadInfo"))
   {
-    struct thread_id_t *ptr = threads.t;
     uint8_t pid_buf[20];
-    assert(threads.len > 0);
     strcpy(tmpbuf, "m");
-    for (int i = 0; i < threads.len; i++, ptr++)
-    {
-      while (!ptr->tid)
-        ptr++;
-      snprintf(pid_buf, sizeof(pid_buf), "p%02x.%02x,", ptr->pid, ptr->tid);
-      strcat(tmpbuf, pid_buf);
-    }
-    tmpbuf[strlen(tmpbuf) - 1] = '\0';
     write_packet(tmpbuf);
   }
   if (!strcmp(name, "sThreadInfo"))
     write_packet("l");
 }
 
-static int gdb_open_flags_to_system_flags(size_t flags)
+void output_string(char *msg)
 {
-  int ret;
-  switch (flags & 3)
-  {
-  case 0:
-    ret = O_RDONLY;
-    break;
-  case 1:
-    ret = O_WRONLY;
-    break;
-  case 2:
-    ret = O_RDWR;
-    break;
-  default:
-    assert(0);
-    return 0;
+  if (strlen(msg) == 0)
+    return;
+
+  sprintf(tmpbuf, "O");
+  while (*msg) {
+    char hex[8];
+    sprintf(hex, "%02x", *(unsigned char *)msg);
+    strcat(tmpbuf, hex);
+    msg++;
   }
-
-  assert(!(flags & ~(size_t)(3 | 0x8 | 0x200 | 0x400 | 0x800)));
-
-  if (flags & 0x8)
-    ret |= O_APPEND;
-  if (flags & 0x200)
-    ret |= O_CREAT;
-  if (flags & 0x400)
-    ret |= O_TRUNC;
-  if (flags & 0x800)
-    ret |= O_EXCL;
-  return ret;
+  write_packet(tmpbuf);
 }
 
 void process_vpacket(char *payload)
@@ -325,35 +131,18 @@ void process_vpacket(char *payload)
   {
     if (args[0] == 'c')
     {
-      for (int i = 0, n = 0; i < THREAD_NUMBER && n < threads.len; i++)
-        if (threads.t[i].tid)
-        {
-          ptrace(PTRACE_CONT, threads.t[i].tid, NULL, NULL);
-          n++;
-        }
-      do
-      {
-        pid_t tid;
-        int stat;
-        enable_async_io();
-        tid = waitpid(-1, &stat, __WALL);
-        set_curr_thread(tid);
-        threads.curr->stat = stat;
-        disable_async_io();
-      } while (check_exit() || check_sigstop() || check_clone());
-      prepare_resume_reply(tmpbuf, true);
+      int exitcode;
+      int result = ptrace(PTRACE_CONT, 0, &exitcode, msgbuf);
+      output_string(msgbuf);
+      prepare_resume_reply(tmpbuf, true, result, exitcode);
       write_packet(tmpbuf);
     }
-    if (args[0] == 's')
+    if (args[0] == 's' || args[0] == 'S' || args[0] == 'C')
     {
-      assert(args[1] == ':');
-      char *dot = strchr(args, '.');
-      assert(dot);
-      pid_t tid = strtol(dot + 1, NULL, 16);
-      set_curr_thread(tid);
-      ptrace(PTRACE_SINGLESTEP, threads.curr->tid, NULL, NULL);
-      waitpid(threads.curr->tid, &threads.curr->stat, __WALL);
-      prepare_resume_reply(tmpbuf, false);
+      int exitcode;
+      int result = ptrace(PTRACE_SINGLESTEP, 0, &exitcode, msgbuf);
+      output_string(msgbuf);
+      prepare_resume_reply(tmpbuf, true, result, exitcode);
       write_packet(tmpbuf);
     }
   }
@@ -361,69 +150,12 @@ void process_vpacket(char *payload)
     write_packet("vCont;c;C;s;S;");
   if (!strcmp("Kill", name))
   {
-    kill(-threads.t[0].pid, SIGKILL);
+    ptrace(PTRACE_KILL, 0, 0, 0);
     write_packet("OK");
+    terminate = true;
   }
   if (!strcmp("MustReplyEmpty", name))
     write_packet("");
-  if (name == strstr(name, "File:"))
-  {
-    char *operation = strchr(name, ':') + 1;
-    if (operation == strstr(operation, "open:"))
-    {
-      char result[10];
-      char *parameter = strchr(operation, ':') + 1;
-      char *end = strchr(parameter, ',');
-      int len, fd;
-      size_t flags, mode;
-      assert(end != NULL);
-      *end = 0;
-      len = strlen(parameter);
-      hex2mem(parameter, tmpbuf, len);
-      tmpbuf[len / 2] = '\0';
-      parameter += len + 1;
-      assert(sscanf(parameter, "%zx,%zx", &flags, &mode) == 2);
-      flags = gdb_open_flags_to_system_flags(flags);
-      assert((mode & ~(int64_t)0777) == 0);
-      fd = open(tmpbuf, flags, mode);
-      sprintf(result, "F%x", fd);
-      write_packet(result);
-    }
-    else if (operation == strstr(operation, "close:"))
-    {
-      char *parameter = strchr(operation, ':') + 1;
-      size_t fd;
-      assert(sscanf(parameter, "%zx", &fd) == 1);
-      close(fd);
-      write_packet("F0");
-    }
-    else if (operation == strstr(operation, "pread:"))
-    {
-      char *parameter = strchr(operation, ':') + 1;
-      size_t fd, size, offset;
-      assert(sscanf(parameter, "%zx,%zx,%zx", &fd, &size, &offset) == 3);
-      assert(size >= 0);
-      if (size * 2 > PACKET_BUF_SIZE)
-        size = PACKET_BUF_SIZE / 2;
-      assert(offset >= 0);
-      char *buf = malloc(size);
-      FILE *fp = fdopen(fd, "rb");
-      fseek(fp, offset, SEEK_SET);
-      int ret = fread(buf, 1, size, fp);
-      sprintf(tmpbuf, "F%x;", ret);
-      write_binary_packet(tmpbuf, buf, ret);
-      free(buf);
-    }
-    else if (operation == strstr(operation, "setfs:"))
-    {
-      char *endptr;
-      int64_t pid = strtol(operation + 6, &endptr, 16);
-      assert(*endptr == 0);
-      write_packet("F0");
-    }
-    else
-      write_packet("");
-  }
 }
 
 bool set_breakpoint(pid_t tid, size_t addr, size_t length)
@@ -437,7 +169,7 @@ bool set_breakpoint(pid_t tid, size_t addr, size_t length)
       breakpoints[i].addr = addr;
       assert(sizeof(break_instr) <= length);
       memcpy((void *)&data, break_instr, sizeof(break_instr));
-      ptrace(PTRACE_POKEDATA, tid, (void *)addr, data);
+      ptrace(PTRACE_POKEDATA, tid, (void *)addr, (void *)data);
       break;
     }
   if (i == BREAKPOINT_NUMBER)
@@ -452,7 +184,7 @@ bool remove_breakpoint(pid_t tid, size_t addr, size_t length)
   for (i = 0; i < BREAKPOINT_NUMBER; i++)
     if (breakpoints[i].addr == addr)
     {
-      ptrace(PTRACE_POKEDATA, tid, (void *)addr, breakpoints[i].orig_data);
+      ptrace(PTRACE_POKEDATA, tid, (void *)addr, (void *)breakpoints[i].orig_data);
       breakpoints[i].addr = 0;
       break;
     }
@@ -499,18 +231,12 @@ void process_packet()
 
   switch (request)
   {
-  case 'D':
-    for (int i = 0, n = 0; i < THREAD_NUMBER && n < threads.len; i++)
-      if (threads.t[i].tid)
-        if (ptrace(PTRACE_DETACH, threads.t[i].tid, NULL, NULL) < 0)
-          perror("ptrace()");
-    exit(0);
   case 'g':
   {
     regs_struct regs;
     uint8_t regbuf[20];
     tmpbuf[0] = '\0';
-    ptrace(PTRACE_GETREGS, threads.curr->tid, NULL, &regs);
+    ptrace(PTRACE_GETREGS, 0, NULL, &regs);
     for (int i = 0; i < ARCH_REG_NUM; i++)
     {
       mem2hex((void *)(((size_t *)&regs) + regs_map[i].idx), regbuf, regs_map[i].size);
@@ -521,21 +247,12 @@ void process_packet()
     break;
   }
   case 'H':
-    if ('g' == *payload++)
-    {
-      pid_t tid;
-      char *dot = strchr(payload, '.');
-      assert(dot);
-      tid = strtol(dot, NULL, 16);
-      if (tid > 0)
-        set_curr_thread(tid);
-    }
     write_packet("OK");
     break;
   case 'm':
   {
     size_t maddr, mlen, mdata;
-    assert(sscanf(payload, "%zx,%zx", &maddr, &mlen) == 2);
+    sscanf(payload, "%x,%x", &maddr, &mlen);
     if (mlen * SZ * 2 > 0x20000)
     {
       puts("Buffer overflow!");
@@ -544,7 +261,7 @@ void process_packet()
     for (int i = 0; i < mlen; i += SZ)
     {
       errno = 0;
-      mdata = ptrace(PTRACE_PEEKDATA, threads.curr->tid, maddr + i, NULL);
+      mdata = ptrace(PTRACE_PEEKDATA, 0, (void *)(maddr + i), NULL);
       if (errno)
       {
         sprintf(tmpbuf, "E%02x", errno);
@@ -560,60 +277,23 @@ void process_packet()
   case 'M':
   {
     size_t maddr, mlen, mdata;
-    assert(sscanf(payload, "%zx,%zx", &maddr, &mlen) == 2);
+    sscanf(payload, "%x,%x", &maddr, &mlen);
+    if ((payload = strchr(payload, ':')) == NULL) {
+      write_packet("OK");
+      break;
+    }
+    payload++;
     for (int i = 0; i < mlen; i += SZ)
     {
       if (mlen - i >= SZ)
         hex2mem(payload + i * 2, (void *)&mdata, SZ);
       else
       {
-        mdata = ptrace(PTRACE_PEEKDATA, threads.curr->tid, maddr + i, NULL);
+        mdata = ptrace(PTRACE_PEEKDATA, 0, (void *)(maddr + i), NULL);
         hex2mem(payload + i * 2, (void *)&mdata, mlen - i);
       }
-      ptrace(PTRACE_POKEDATA, threads.curr->tid, maddr + i, mdata);
+      ptrace(PTRACE_POKEDATA, 0, (void *)(maddr + i), (void *)mdata);
     }
-    write_packet("OK");
-    break;
-  }
-  case 'p':
-  {
-    int i = strtol(payload, NULL, 16);
-    if (i >= ARCH_REG_NUM && i != EXTRA_NUM)
-    {
-      write_packet("E01");
-      break;
-    }
-    size_t regdata;
-    if (i == EXTRA_NUM)
-    {
-      regdata = ptrace(PTRACE_PEEKUSER, threads.curr->tid, SZ * EXTRA_REG, NULL);
-      mem2hex((void *)&regdata, tmpbuf, EXTRA_SIZE);
-      tmpbuf[EXTRA_SIZE * 2] = '\0';
-    }
-    else
-    {
-      regdata = ptrace(PTRACE_PEEKUSER, threads.curr->tid, SZ * regs_map[i].idx, NULL);
-      mem2hex((void *)&regdata, tmpbuf, regs_map[i].size);
-      tmpbuf[regs_map[i].size * 2] = '\0';
-    }
-    write_packet(tmpbuf);
-    break;
-  }
-  case 'P':
-  {
-    int i = strtol(payload, &payload, 16);
-    assert('=' == *payload++);
-    if (i >= ARCH_REG_NUM && i != EXTRA_NUM)
-    {
-      write_packet("E01");
-      break;
-    }
-    size_t regdata = 0;
-    hex2mem(payload, (void *)&regdata, SZ * 2);
-    if (i == EXTRA_NUM)
-      ptrace(PTRACE_POKEUSER, threads.curr->tid, SZ * EXTRA_REG, regdata);
-    else
-      ptrace(PTRACE_POKEUSER, threads.curr->tid, SZ * regs_map[i].idx, regdata);
     write_packet("OK");
     break;
   }
@@ -626,9 +306,13 @@ void process_packet()
   case 'X':
   {
     size_t maddr, mlen, mdata;
-    int offset, new_len;
-    assert(sscanf(payload, "%zx,%zx:%n", &maddr, &mlen, &offset) == 2);
-    payload += offset;
+    int new_len;
+    sscanf(payload, "%x,%x:", &maddr, &mlen);
+    if ((payload = strchr(payload, ':')) == NULL) {
+      write_packet("OK");
+      break;
+    }
+    payload++;
     new_len = unescape(payload, (char *)packetend_ptr - payload);
     assert(new_len == mlen);
     for (int i = 0; i < mlen; i += SZ)
@@ -637,10 +321,10 @@ void process_packet()
         memcpy((void *)&mdata, payload + i, SZ);
       else
       {
-        mdata = ptrace(PTRACE_PEEKDATA, threads.curr->tid, maddr + i, NULL);
+        mdata = ptrace(PTRACE_PEEKDATA, 0, (void *)(maddr + i), NULL);
         memcpy((void *)&mdata, payload + i, mlen - i);
       }
-      ptrace(PTRACE_POKEDATA, threads.curr->tid, maddr + i, mdata);
+      ptrace(PTRACE_POKEDATA, 0, (void *)(maddr + i), (void *)mdata);
     }
     write_packet("OK");
     break;
@@ -648,10 +332,10 @@ void process_packet()
   case 'Z':
   {
     size_t type, addr, length;
-    assert(sscanf(payload, "%zx,%zx,%zx", &type, &addr, &length) == 3);
+    sscanf(payload, "%x,%x,%x", &type, &addr, &length);
     if (type == 0 && sizeof(break_instr))
     {
-      bool ret = set_breakpoint(threads.curr->tid, addr, length);
+      bool ret = set_breakpoint(0, addr, length);
       if (ret)
         write_packet("OK");
       else
@@ -664,10 +348,10 @@ void process_packet()
   case 'z':
   {
     size_t type, addr, length;
-    assert(sscanf(payload, "%zx,%zx,%zx", &type, &addr, &length) == 3);
+    sscanf(payload, "%x,%x,%x", &type, &addr, &length);
     if (type == 0)
     {
-      bool ret = remove_breakpoint(threads.curr->tid, addr, length);
+      bool ret = remove_breakpoint(0, addr, length);
       if (ret)
         write_packet("OK");
       else
@@ -689,86 +373,81 @@ void process_packet()
 
 void get_request()
 {
-  while (true)
+  int first = true;
+
+  while (!terminate)
   {
     read_packet();
+    if (first) {
+      printf("Connected\n");
+      first = false;
+    }
     process_packet();
     write_flush();
   }
 }
 
+extern struct dos_comline *_cmdline;
+static const char *target = NULL;
+static struct dos_comline target_cmdline;
+
 int main(int argc, char *argv[])
 {
-  pid_t pid;
-  char **next_arg = &argv[1];
-  char *arg_end, *target = NULL;
-  int stat;
+  int ac;
+  int help = false;
 
-  if (*next_arg != NULL && strcmp(*next_arg, "--attach") == 0)
-  {
-    attach = true;
-    next_arg++;
-  }
-
-  target = *next_arg;
-  next_arg++;
-
-  if (target == NULL || *next_arg == NULL)
-  {
-    printf("Usage : gdbserver 127.0.0.1:1234 a.out or gdbserver --attach 127.0.0.1:1234 2468\n");
-    exit(-1);
-  }
-
-  if (attach)
-  {
-    pid = atoi(*next_arg);
-    init_tids(pid);
-    for (int i = 0, n = 0; i < THREAD_NUMBER && n < threads.len; i++)
-      if (threads.t[i].tid)
-      {
-        if (ptrace(PTRACE_ATTACH, threads.t[i].tid, NULL, NULL) < 0)
-        {
-          perror("ptrace()");
-          return -1;
-        }
-        if (waitpid(threads.t[i].tid, &threads.t[i].stat, __WALL) < 0)
-        {
-          perror("waitpid");
-          return -1;
-        }
-        ptrace(PTRACE_SETOPTIONS, threads.t[i].tid, NULL, PTRACE_O_TRACECLONE);
-        n++;
+  for (ac = 1; ac < argc; ac++) {
+    if (argv[ac][0] == '-') {
+      /* command option */
+      switch (argv[ac][1]) {
+      case 'D':
+        debuglevel++;
+        break;
+      default:
+        help = true;
       }
-  }
-  else
-  {
-    pid = fork();
-    if (pid == 0)
-    {
-      char **args = next_arg;
-      setpgrp();
-      ptrace(PTRACE_TRACEME, 0, NULL, NULL);
-      execvp(args[0], args);
-      perror(args[0]);
-      _exit(1);
+    } else {
+      target = argv[ac];
+      break;
     }
-    if (waitpid(pid, &stat, __WALL) < 0)
-    {
-      perror("waitpid");
-      return -1;
-    }
-    threads.t[0].pid = threads.t[0].tid = pid;
-    threads.t[0].stat = stat;
-    threads.len = 1;
-    int options = PTRACE_O_TRACECLONE;
-#ifdef PTRACE_O_EXITKILL
-    options |= PTRACE_O_EXITKILL;
-#endif
-    ptrace(PTRACE_SETOPTIONS, pid, NULL, options);
   }
-  threads.curr = &threads.t[0];
-  initialize_async_io(sigint_pid);
-  remote_prepare(target);
+
+  if (target == NULL || help) {
+    printf("Usage: %s [options] <target> [target args..]\n", argv[0]);
+    exit(1);
+  }
+
+  int p;
+  bool f = false;
+  for (p = 0; p < _cmdline->len; p++) {
+    if (!f) {
+      if (_cmdline->buffer[p] == ' ')
+        continue;
+      f = true;
+      if (--ac < 0)
+        break;
+    } else {
+      if (_cmdline->buffer[p] != ' ')
+        continue;
+      f = false;
+    }
+  }
+  target_cmdline.len = _cmdline->len - p;
+  memset(target_cmdline.buffer, 0, sizeof(target_cmdline.buffer));
+  memcpy(target_cmdline.buffer, &_cmdline->buffer[p], target_cmdline.len);
+
+  remote_prepare(NULL);
+
+  _iocs_b_super(0);
+  target_offset = target_load(target, &target_cmdline, NULL);
+
+  if ((int)target_offset < 0) {
+    printf("Target %s load error\n", target);
+    exit(1);
+  }
+
+  printf("Target %s waiting for connection...", target);
+  fflush(stdout);
   get_request();
   return 0;
 }
