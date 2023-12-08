@@ -1,16 +1,29 @@
-cc = gcc
-prom = gdbserver
-obj = gdbserver.o utils.o packets.o signals.o
-cflags = -std=gnu99
+CROSS = m68k-xelf-
+CC = $(CROSS)gcc
+AS = $(CROSS)gcc
+LD = $(CROSS)gcc
+AR = $(CROSS)ar
+RANLIB = $(CROSS)ranlib
+OBJCOPY = $(CROSS)objcopy
 
-$(prom): $(obj)
-	$(cc) $(cflags) -o $(prom) $(obj)
+#GIT_REPO_VERSION=$(shell git describe --tags --always)
 
-gdbserver.o : gdbserver.c arch.h utils.h packets.h gdb_signals.h
-	$(cc) $(cflags) -c $< -o $@
+CFLAGS = -g -std=gnu99 -O
+CFLAGS += -finput-charset=utf-8 -fexec-charset=cp932
 
-signals.o : signals.c gdb_signals.h gdb/signals.h gdb/signals.def
-	$(cc) $(cflags) -c $< -o $@
+OBJS = gdbserver.o utils.o packets.o ptrace.o
+
+all: gdbserver.x
+
+gdbserver.x: $(OBJS)
+	$(CC) -o $@ $^
+
+gdbserver.o : gdbserver.c arch.h utils.h packets.h ptrace.h
 
 %.o: %.c
-	$(cc) $(cflags) -c $< -o $@
+	$(CC) $(CFLAGS) -c -o $@ $<
+
+clean:
+	-rm -f *.o *.x*
+
+.PHONY: all clean
