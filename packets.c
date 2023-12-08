@@ -146,9 +146,25 @@ void write_binary_packet(const char *pfx, const uint8_t *data, ssize_t num_bytes
 
 static int inp232c(void)
 {
-    while (_iocs_isns232c() == 0)
-        ;
-    int c = _iocs_inp232c() & 0xff;
+    int c;
+    uint16_t sr;
+    __asm__ ("move.w %%sr,%0" : "=d"(sr));
+
+    if ((sr & 0x0700) < 0x0500) {           // SCC interrupt enable
+        while (_iocs_isns232c() == 0)
+            ;
+        c = _iocs_inp232c() & 0xff;
+    } else {                                // SCC interrupt disable
+        if (_iocs_isns232c()) {
+            c = _iocs_inp232c() & 0xff;
+        } else {
+            c = *(volatile uint16_t *)0xe98004;         // Ch.A command port (select RR0)
+            do {
+                c = *(volatile uint16_t *)0xe98004;
+            } while (!(c & 1));                         // wait for Rx char available
+            c = *(volatile uint16_t *)0xe98006 & 0xff;  // Ch.A data port
+        }
+    }
 
     if (debuglevel > 1)
     {

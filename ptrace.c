@@ -9,6 +9,7 @@
 #include "ptrace.h"
 
 extern int debuglevel;
+extern int intrmode;
 
 #define ELF_START_ADDR          0x6800
 
@@ -487,6 +488,12 @@ int ptrace(int request, int pid, void *addr, void *data)
       intarget = false;
       _dos_breakck(2);
 
+      if (intrmode == 0)
+        __asm__ ("andi.w #0xf8ff,%sr"); // -i0: デバッガ内では常に割り込み許可
+      else if (intrmode == 2)
+        __asm__ ("ori.w #0x0700,%sr");  // -i2: デバッガ内では常に割り込み禁止
+                                        // (-i1 の場合はデバッグ対象の割り込み許可状態を引き継ぐ)
+
       if (result > 0) {     // デバッグ対象の実行が中断された
         *(uint32_t *)addr = decode_trap(result, data);
       } else {              //　デバッグ対象の実行が終了した
@@ -552,7 +559,7 @@ int target_load(const char *name, struct dos_comline *cmdline, const char *env)
     printf("Target addr:0x%x usp:0x%x ssp:0x%x\n", target_psp, target_regs.usp, target_regs.ssp);
     if (debuglevel > 0) {
       extern char _start;
-        printf("Debugger addr:%p\n", &_start);
+      printf("Debugger addr:%p\n", &_start);
     }
 
     /* 実際のロードアドレスからELFバイナリ先頭アドレスへのオフセット値を返す */

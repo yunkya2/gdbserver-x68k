@@ -14,6 +14,7 @@
 uint32_t target_offset;
 bool terminate = false;
 int debuglevel = 0;
+int intrmode = 0;
 
 #define BREAKPOINT_NUMBER 64
 
@@ -396,8 +397,8 @@ static void help(char *argv[])
   printf(
     "Usage: %s [<options>] <target> [<target args>..]\n"
     "Options:\n"
-    "-s<speed> : set serial speed\n"
-    "-D        : increase debug level\n"
+    "  -s<speed> : set serial speed\n"
+    "  -i<mode>  : select interrupt mode (0-2)\n"
     , argv[0]);
   exit(1);
 }
@@ -413,6 +414,9 @@ int main(int argc, char *argv[])
       switch (argv[ac][1]) {
       case 's':
         speed = &argv[ac][2];
+        break;
+      case 'i':
+        intrmode = atoi(&argv[ac][2]);
         break;
       case 'D':
         debuglevel++;
