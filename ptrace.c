@@ -93,7 +93,7 @@ static void nmi_trap(void)
     "clr.w %sp@-\n"
     "2:\n"
     "pea.l %pc@(common_trap)\n"               // common_trap へrteでジャンプ
-    "move.w #0x2000,%sp@-\n"                  // (NMI割り込み状態を解除するため)
+    "move.w #0x2700,%sp@-\n"                  // (NMI割り込み状態を解除するため)
     "rte\n"         
   );
 }
