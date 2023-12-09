@@ -178,11 +178,23 @@ static int inp232c(void)
     return c;
 }
 
-void read_packet()
+int read_packet(int waitkey)
 {
     uint8_t c;
     pktbuf_clear(&in);
     do {
+        if (waitkey) {
+            do {
+                int key = _iocs_b_keysns();
+                if (key) {
+                    key = _iocs_b_keyinp();
+                    if (key & 0xff) {
+                        return -1;
+                    }
+                }
+            } while (_iocs_isns232c() == 0);
+        }
+
         c = inp232c();
         if (c == INTERRUPT_CHAR) {
             ctrlc = true;
@@ -202,6 +214,7 @@ void read_packet()
 
     write_data_raw((uint8_t *)"+", 1);
     write_flush();
+    return 0;
 }
 
 void remote_prepare(char *speed)

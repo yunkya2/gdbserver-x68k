@@ -378,7 +378,11 @@ void get_request()
 
   while (!terminate)
   {
-    read_packet();
+    if (read_packet(first) < 0) {
+      printf("Aborted\n");
+      ptrace(PTRACE_KILL, 0, 0, 0);
+      break;
+    }
     if (first) {
       printf("Connected\n");
       first = false;
