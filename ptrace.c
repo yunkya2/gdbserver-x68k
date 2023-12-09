@@ -434,6 +434,15 @@ static void update_sp(void)
     target_regs.a[7] = target_regs.usp;   // User stack
 }
 
+/* SRの実行モードを見てA7をUSP or SSPに設定する */
+static void retrieve_sp(void)
+{
+  if (target_regs.sr & 0x2000)
+    target_regs.ssp = target_regs.a[7];   // Supervisor stack
+  else
+    target_regs.usp = target_regs.a[7];   // User stack
+}
+
 /* メモリのread/write (バスエラーチェックつき) */
 /* in:  addr  = 読み書きアドレス
  *      datap = 読み書きデータへのポインタ　　
@@ -544,6 +553,19 @@ int ptrace(int request, int pid, void *addr, void *data)
        */
       update_sp();
       memcpy(data, &target_regs, sizeof(target_regs));
+      break;
+
+    case PTRACE_SETREGS:
+      /* dataをデバッグ対象アプリのレジスタ値として設定する
+       */
+      struct pt_regs *newregs = data;
+      for (int i = 0; i < 8; i++) {
+        target_regs.d[i] = newregs->d[i];
+        target_regs.a[i] = newregs->a[i];
+      }
+      target_regs.sr = newregs->sr;
+      target_regs.pc = newregs->pc;
+      retrieve_sp();
       break;
 
     case PTRACE_KILL:

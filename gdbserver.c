@@ -247,6 +247,18 @@ void process_packet()
     write_packet(tmpbuf);
     break;
   }
+  case 'G':
+  {
+    regs_struct regs;
+    for (int i = 0; i < ARCH_REG_NUM; i++)
+    {
+      hex2mem(payload, (void *)(((size_t *)&regs) + regs_map[i].idx), regs_map[i].size * 2);
+      payload += regs_map[i].size * 2;
+    }
+    ptrace(PTRACE_SETREGS, 0, NULL, &regs);
+    write_packet("OK");
+    break;
+  }
   case 'H':
     write_packet("OK");
     break;
