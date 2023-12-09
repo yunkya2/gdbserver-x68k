@@ -12,6 +12,7 @@
 #include "packets.h"
 
 extern int debuglevel;
+extern int ctrlc;
 
 struct packet_buf
 {
@@ -183,7 +184,11 @@ void read_packet()
     pktbuf_clear(&in);
     do {
         c = inp232c();
-    } while (c != '$' && c != INTERRUPT_CHAR);
+        if (c == INTERRUPT_CHAR) {
+            ctrlc = true;
+            continue;
+        }
+    } while (c != '$');
 
     pktbuf_insert(&in, &c, 1);
     do {

@@ -15,6 +15,7 @@ uint32_t target_offset;
 bool terminate = false;
 int debuglevel = 0;
 int intrmode = 0;
+int ctrlc = 0;
 
 #define BREAKPOINT_NUMBER 64
 
@@ -225,7 +226,6 @@ void process_packet()
   inbuf[packetend] = '\0';
 
   uint8_t checksum = 0;
-  uint8_t checksum_str[3];
   for (int i = 1; i < packetend; i++)
     checksum += inbuf[i];
   assert(checksum == (hex(inbuf[packetend + 1]) << 4 | hex(inbuf[packetend + 2])));

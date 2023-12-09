@@ -10,6 +10,7 @@
 
 extern int debuglevel;
 extern int intrmode;
+extern int ctrlc;
 
 #define ELF_START_ADDR          0x6800
 
@@ -66,6 +67,7 @@ static struct vectdata {
 static void common_trap(void)
 {
   __asm__ volatile(
+    "ori.w #0x0700,%sr\n"         // disable interrupt
     "movem.l %d0-%d7/%a0-%a6,target_regs\n"   // デバッグ対象のレジスタ保存
     "moveq.l #0,%d0\n"
     "move.w %sp@+,%d0\n"                      // 発生した例外のベクタアドレス (do_cont()/do_singlestep()の戻り値)
@@ -102,6 +104,13 @@ static void nmi_trap(void)
 static void common_exit(void)
 {
   __asm__ volatile(
+    // デバッグ対象がDOSコール実行時のCTRL+Cで中断・終了すると、DOSコール呼び出し前の
+    // 特権モードで終了処理(common_exit())が呼ばれるので、スーパバイザモードに入り直す
+    "suba.l %a1,%a1\n"
+    "moveq.l #0xffffff81,%d0\n"
+    "trap #15\n"                              // IOCS _B_SUPER
+
+    "ori.w #0x0700,%sr\n"                     // disable interrupt
     "movem.l gdb_regs,%d2-%d7/%a2-%a7\n"      // gdbserverのレジスタを復帰
     "moveq.l #-1,%d0\n"                       // do_cont()/do_singlestep()の戻り値
   );
@@ -153,6 +162,73 @@ static void flash_icache(void)
       : : : "%%d0", "%%d1"
     );
   }
+}
+
+/****************************************************************************/
+
+uint32_t sccrx_vect;            // 設定変更前のSCC Rx割り込みベクタ
+
+/* デバッグ対象実行中に使われるSCC Rx割り込み */
+/* 実行中にシリアルポートからデータが来たら本来の受信処理を実行後、
+ * sccrx_intr_after()へジャンプする
+ */
+__attribute__((noinline))
+static void sccrx_intr(void)
+{
+  __asm__ volatile(
+    "tst.b 0xcbc.w\n"             // CPU type
+    "beq 1f\n"
+    "clr.w %sp@-\n"
+    "1:\n"
+    "pea.l %pc@(sccrx_intr_after)\n"
+    "move.w %sr,%sp@-\n"
+    "move.l sccrx_vect,%sp@-\n"
+  );
+}
+
+/* デバッグ対象実行中に使われるSCC Rx割り込み後処理 */
+/* シリアルポートの入力データをチェックし、CTRL+Cだったら
+ * デバッグ対象をSIGINTで停止させる
+ */
+__attribute__((interrupt, used))
+static void sccrx_intr_after(void)
+{
+  __asm__ volatile(
+    "move.l %d0,%sp@-\n"
+
+    "moveq.l #0x33,%d0\n"
+    "trap #15\n"                // IOCS _ISNS232C
+    "tst.l %d0\n"
+    "beq 9f\n"
+
+    "moveq.l #0x32,%d0\n"
+    "trap #15\n"                // IOCS _INP232C
+    "cmpi.b #0x03,%d0\n"
+    "bne 9f\n"
+
+    // CTRL+Cを示すベクタ番号(0)をスタックに積んでcommon_trapへジャンプする
+    "move.l %sp@+,%d0\n"
+    "clr.w %sp@-\n"
+    "bra common_trap\n"
+
+    "9:\n"
+    "movem.l %sp@+,%d0\n"
+  );
+}
+
+/* SCC Rx割り込みのベクタを設定 */
+static void set_sccrx_vector(void)
+{
+  sccrx_vect = *(uint32_t *)0x0170;
+  *(uint32_t *)0x0170 = (uint32_t)sccrx_intr;
+  *(uint32_t *)0x0174 = (uint32_t)sccrx_intr;
+}
+
+/* SCC Rx割り込みのベクタを復元 */
+static void restore_sccrx_vector(void)
+{
+  *(uint32_t *)0x0170 = sccrx_vect;
+  *(uint32_t *)0x0174 = sccrx_vect;
 }
 
 /****************************************************************************/
@@ -268,6 +344,7 @@ static int decode_trap(int trapvect, char *msg)
     res = 11;         // SIGSEGV
     break;
 
+  case 0x00:          // CTRL+C
   case 0x7c:          // NMI
     target_regs.ssp += sizeof(struct frame_m68000_excep);
     res = 2;          // SIGINT
@@ -279,6 +356,10 @@ static int decode_trap(int trapvect, char *msg)
   case 0x24:          // Trace
     target_regs.ssp += sizeof(struct frame_m68000_excep);
     res = 5;          // SIGTRAP
+    if (ctrlc) {            // ステップ実行中にCTRL+Cを受信したらSIGINTを返す
+      res = 2;        // SIGINT
+      ctrlc = false;
+    }
     break;
   }
 
@@ -360,7 +441,7 @@ static void update_sp(void)
  *      rw    = 0:read / 1:write
  * out: 0:正常に読み書きできた / 1:バスエラー発生
 */
-int memory_rw(void *addr, void *datap, int size, int rw)
+static int memory_rw(void *addr, void *datap, int size, int rw)
 {
   int res;
   __asm__ volatile(
@@ -484,31 +565,35 @@ int ptrace(int request, int pid, void *addr, void *data)
        *       <0   プログラム終了
        *              *addr: 終了コード
        */
-      update_sp();
       flash_icache();
       _dos_breakck(gdb_breakck);
+      __asm__ ("ori.w #0x0700,%sr");
+      set_sccrx_vector();
       intarget = true;
       result = (request == PTRACE_CONT) ? do_cont() : do_singlestep();
       intarget = false;
+      restore_sccrx_vector();
       _dos_breakck(2);
 
-      if (intrmode == 0)
-        __asm__ ("andi.w #0xf8ff,%sr"); // -i0: デバッガ内では常に割り込み許可
-      else if (intrmode == 2)
-        __asm__ ("ori.w #0x0700,%sr");  // -i2: デバッガ内では常に割り込み禁止
-                                        // (-i1 の場合はデバッグ対象の割り込み許可状態を引き継ぐ)
-
-      if (result > 0) {     // デバッグ対象の実行が中断された
+      if (result >= 0) {     // デバッグ対象の実行が中断された
+        // 例外スタックフレームの内容を引き上げる
         *(uint32_t *)addr = decode_trap(result, data);
+
+        // do_cont()/do_singlestep()からは割り込み禁止状態で戻ってくるので、
+        // モードに応じて適切な状態に変更する
+        if (intrmode == 0) {                // -i0: デバッガ内では常に割り込み許可
+          __asm__ ("andi.w #0xf8ff,%sr");
+        } else if (intrmode == 1) {         // -i1: デバッグ対象の割り込み許可状態を引き継ぐ
+          __asm__ ("move.w %0,%%sr" : : "d"((target_regs.sr & 0x0700)|0x2000));
+        }                                   // -i2: デバッガ内では常に割り込み禁止
       } else {              //　デバッグ対象の実行が終了した
-        *(uint32_t *)addr = _dos_wait();    // 終了コードを引き取る
-        // デバッグ対象がDOSコール実行時のCTRL+Cで中断・終了すると、DOSコール呼び出し前の
-        // 特権モードで終了処理(common_exit())が呼ばれるので、スーパバイザモードに入り直す
-        _iocs_b_super(0);
+        if (addr != NULL)
+          *(uint32_t *)addr = _dos_wait();  // 終了コードを引き取る
         // デバッガ自体を終了するため、変更したベクタを復帰しプロセス管理ポインタをデバッガに切り替え
         restore_vector();
         _dos_setpdb(gdb_psp);
         _dos_breakck(gdb_breakck);
+        __asm__ ("andi.w #0xf8ff,%sr");
       }
       break;
   }
