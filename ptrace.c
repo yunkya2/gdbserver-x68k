@@ -225,6 +225,10 @@ static int decode_trap(int trapvect, char *msg)
         printf("exception frame type %d\n", type);
       }
       switch (type) {
+      case 0x4:   // 68060 access error stack frame
+        faultaddr = *(uint32_t *)(target_regs.ssp + 0x08 - 0x06);
+        rw = *(uint32_t *)(target_regs.ssp + 0x0c - 0x06) & (1 << 24);
+        break;
       case 0x7:   // 68040 access error stack frame
         faultaddr = *(uint32_t *)(target_regs.ssp + 0x14 - 0x06);
         rw = *(uint16_t *)(target_regs.ssp + 0x0c - 0x06) & 0x0100;
