@@ -22,7 +22,7 @@ AR = $(CROSS)ar
 RANLIB = $(CROSS)ranlib
 OBJCOPY = $(CROSS)objcopy
 
-#GIT_REPO_VERSION=$(shell git describe --tags --always)
+GIT_REPO_VERSION=$(shell git describe --tags --always)
 
 CFLAGS = -g -std=gnu99 -O
 CFLAGS += -finput-charset=utf-8 -fexec-charset=cp932
@@ -40,6 +40,14 @@ gdbserver.o : gdbserver.c arch.h utils.h packets.h ptrace.h
 	$(CC) $(CFLAGS) -c -o $@ $<
 
 clean:
-	-rm -f *.o *.x*
+	-rm -rf *.o *.x* build
 
-.PHONY: all clean
+RELFILE := gdbserver-x68k-$(GIT_REPO_VERSION).zip
+
+release: all
+	rm -rf build && mkdir build
+	cat README.68k | sed "s/\$$(VERSION)/$(GIT_REPO_VERSION)/" | iconv -f utf-8 -t cp932 > build/README.txt
+	cp gdbserver.x build
+	(cd build; zip -r ../$(RELFILE) *)
+
+.PHONY: all clean release
