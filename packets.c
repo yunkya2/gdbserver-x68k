@@ -191,6 +191,7 @@ static int inp232c(void)
             printf("{%02X}", c);
           else
             printf("%c", c);
+        fflush(stdout);
     }
 
     return c;
