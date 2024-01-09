@@ -30,6 +30,7 @@
 #include <x68k/iocs.h>
 
 uint32_t target_offset;
+uint32_t target_base = 0;
 bool terminate = false;
 int debuglevel = 0;
 int intrmode = 0;
@@ -433,6 +434,7 @@ static void help(char *argv[])
     "Options:\n"
     "  -s<speed> : set serial speed\n"
     "  -i<mode>  : select interrupt mode (0-2)\n"
+    "  -b<addr>  : ELF binary base address\n"
     , argv[0]);
   exit(1);
 }
@@ -451,6 +453,9 @@ int main(int argc, char *argv[])
         break;
       case 'i':
         intrmode = atoi(&argv[ac][2]);
+        break;
+      case 'b':
+        target_base = strtol(&argv[ac][2], NULL, 0);
         break;
       case 'D':
         debuglevel++;
@@ -489,7 +494,7 @@ int main(int argc, char *argv[])
   remote_prepare(speed);
 
   _iocs_b_super(0);
-  target_offset = target_load(target, &target_cmdline, NULL);
+  target_offset = target_load(target, &target_cmdline, NULL) - target_base;
 
   if ((int)target_offset < 0) {
     printf("Target %s load error\n", target);

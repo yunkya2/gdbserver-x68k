@@ -29,8 +29,6 @@ extern int debuglevel;
 extern int intrmode;
 extern int ctrlc;
 
-#define ELF_START_ADDR          0x6800
-
 /****************************************************************************/
 
 /* デバッグ対象アプリのコンテキスト */
@@ -684,14 +682,14 @@ int target_load(const char *name, struct dos_comline *cmdline, const char *env)
     _dos_setpdb(target_psp);
     set_vector();
 
-    printf("Target addr:0x%x usp:0x%x ssp:0x%x\n", target_psp, target_regs.usp, target_regs.ssp);
+    printf("Target addr:0x%x usp:0x%x ssp:0x%x\n", target_regs.a[0] + 0x100, target_regs.usp, target_regs.ssp);
     if (debuglevel > 0) {
       extern char _start;
       printf("Debugger addr:%p\n", &_start);
     }
 
-    /* 実際のロードアドレスからELFバイナリ先頭アドレスへのオフセット値を返す */
-    return target_regs.a[0] + 0x100 - ELF_START_ADDR;
+    /* デバッグ対象アプリのロードアドレスを返す */
+    return target_regs.a[0] + 0x100;
   }
 
   return res;
