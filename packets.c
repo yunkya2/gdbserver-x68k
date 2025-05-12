@@ -250,7 +250,7 @@ void remote_prepare(char *speed)
         }
     }
     if (bdset < 0)
-        bdset = 9;      // 38400
+        bdset = 7;      // 9600
 
     // stop 1 / nonparity / 8bit / nonxoff
     _iocs_set232c(0x4c00 | bdset);
