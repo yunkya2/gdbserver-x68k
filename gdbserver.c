@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023,2024 Yuichi Nakamura (@yunkya2)
+ * Copyright (C) 2023-2025 Yuichi Nakamura (@yunkya2)
  * Based upon gdbserver.c by @bet4it
  *
  * This program is free software; you can redistribute it and/or modify
@@ -26,6 +26,7 @@
 #include "utils.h"
 #include "packets.h"
 #include "ptrace.h"
+#include "pthreadlib.h"
 #include <x68k/dos.h>
 #include <x68k/iocs.h>
 
@@ -35,6 +36,7 @@ bool terminate = false;
 int debuglevel = 0;
 int intrmode = 0;
 int ctrlc = 0;
+int select_tid = 0;
 
 #define BREAKPOINT_NUMBER 64
 
@@ -55,7 +57,11 @@ void prepare_resume_reply(uint8_t *buf, bool cont, int result, int exitcode)
     sprintf(buf, "W%02x", exitcode);
     terminate = true;
   } else {
-    sprintf(buf, "S%02x", exitcode);
+    if (current_tid < 0) {
+      sprintf(buf, "S%02x", exitcode);
+    } else {
+      sprintf(buf, "T%02xthread:%x;", exitcode, current_tid + 1);
+    }
   }
 }
 
@@ -79,7 +85,7 @@ void process_query(char *payload)
   name = payload;
   if (!strcmp(name, "C"))
   {
-    snprintf(tmpbuf, sizeof(tmpbuf), "QCp%02x.%02x", 1, 1);
+    snprintf(tmpbuf, sizeof(tmpbuf), "QC%x", (current_tid < 0) ? 1 : (current_tid + 1));
     write_packet(tmpbuf);
   }
   if (!strcmp(name, "Attached"))
@@ -103,7 +109,15 @@ void process_query(char *payload)
   {
     args = payload;
     args = 1 + strchr(args, ',');
-    write_packet("41414141");
+    int t;
+    sscanf(args, "%x", &t);
+    char *name = "Human68k system";
+    if (current_tid >= 0) {
+      struct dos_prcptr *prc = get_prcptr(t - 1);
+      name = prc->name;
+    }
+    mem2hex(name, tmpbuf, strlen(name));
+    write_packet(tmpbuf);
   }
   if (!strcmp(name, "TStatus"))
     write_packet("");
@@ -116,8 +130,19 @@ void process_query(char *payload)
   }
   if (!strcmp(name, "fThreadInfo"))
   {
-    uint8_t pid_buf[20];
     strcpy(tmpbuf, "m");
+    if (current_tid >= 0) {
+      if (main_pi) {
+        snprintf(tmpbuf + 1, sizeof(tmpbuf) - 1, "%x", main_pi->tid + 1);
+        for (pthread_internal_t *pi = main_pi->next; pi; pi = pi->next) {
+          char tid[20];
+          snprintf(tid, sizeof(tid), ",%x", pi->tid + 1);
+          strcat(tmpbuf, tid);
+        }
+      } else {
+        snprintf(tmpbuf + 1, sizeof(tmpbuf) - 1, "%x", current_tid + 1);
+      }
+    }
     write_packet(tmpbuf);
   }
   if (!strcmp(name, "sThreadInfo"))
@@ -154,6 +179,7 @@ void process_vpacket(char *payload)
     {
       int exitcode;
       int result = ptrace(PTRACE_CONT, 0, &exitcode, msgbuf);
+      select_tid = current_tid;
       output_string(msgbuf);
       prepare_resume_reply(tmpbuf, true, result, exitcode);
       write_packet(tmpbuf);
@@ -162,6 +188,7 @@ void process_vpacket(char *payload)
     {
       int exitcode;
       int result = ptrace(PTRACE_SINGLESTEP, 0, &exitcode, msgbuf);
+      select_tid = current_tid;
       output_string(msgbuf);
       prepare_resume_reply(tmpbuf, true, result, exitcode);
       write_packet(tmpbuf);
@@ -256,7 +283,7 @@ void process_packet()
     regs_struct regs;
     uint8_t regbuf[20];
     tmpbuf[0] = '\0';
-    ptrace(PTRACE_GETREGS, 0, NULL, &regs);
+    ptrace(PTRACE_GETREGS, select_tid, NULL, &regs);
     for (int i = 0; i < ARCH_REG_NUM; i++)
     {
       mem2hex((void *)(((size_t *)&regs) + regs_map[i].idx), regbuf, regs_map[i].size);
@@ -274,13 +301,18 @@ void process_packet()
       hex2mem(payload, (void *)(((size_t *)&regs) + regs_map[i].idx), regs_map[i].size * 2);
       payload += regs_map[i].size * 2;
     }
-    ptrace(PTRACE_SETREGS, 0, NULL, &regs);
+    ptrace(PTRACE_SETREGS, select_tid, NULL, &regs);
     write_packet("OK");
     break;
   }
   case 'H':
+  {
+    int t;
+    sscanf(payload + 1, "%x", &t);
+    select_tid = (t - 1) > 0 ? (t - 1) : 0;
     write_packet("OK");
     break;
+  }
   case 'm':
   {
     size_t maddr, mlen, mdata;
@@ -393,6 +425,25 @@ void process_packet()
       write_packet("");
     break;
   }
+  case 'T':
+  {
+    int t;
+    sscanf(payload, "%x", &t);
+    if (current_tid >= 0) {
+      pthread_internal_t *pi;
+      for (pi = main_pi; pi; pi = pi->next) {
+        if (pi->tid == t - 1) {
+          write_packet("OK");
+          break;
+        }
+      }
+      if (pi != NULL) {
+        break;
+      }
+    }
+    write_packet("");
+    break;
+  }
   case '?':
     write_packet("S05");
     break;
@@ -430,6 +481,7 @@ static struct dos_comline target_cmdline;
 static void help(char *argv[])
 {
   printf(
+    "gdbserver-x68k version " GIT_REPO_VERSION "\n"
     "Usage: %s [<options>] <target> [<target args>..]\n"
     "Options:\n"
     "  -s<speed> : set serial speed\n"

@@ -1,5 +1,5 @@
 #
-# Copyright (C) 2023 Yuichi Nakamura (@yunkya2)
+# Copyright (C) 2023-2025 Yuichi Nakamura (@yunkya2)
 #
 # This program is free software; you can redistribute it and/or modify
 # it under the terms of the GNU General Public License as published by
@@ -24,8 +24,7 @@ OBJCOPY = $(CROSS)objcopy
 
 GIT_REPO_VERSION=$(shell git describe --tags --always)
 
-CFLAGS = -g -std=gnu99 -O
-CFLAGS += -finput-charset=utf-8 -fexec-charset=cp932
+CFLAGS = -g -std=gnu99 -Os -DGIT_REPO_VERSION=\"$(GIT_REPO_VERSION)\"
 
 OBJS = gdbserver.o utils.o packets.o ptrace.o
 

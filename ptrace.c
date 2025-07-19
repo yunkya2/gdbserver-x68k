@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2023,2024 Yuichi Nakamura (@yunkya2)
+ * Copyright (C) 2023-2025 Yuichi Nakamura (@yunkya2)
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
@@ -24,6 +24,7 @@
 #include <x68k/dos.h>
 #include <x68k/iocs.h>
 #include "ptrace.h"
+#include "pthreadlib.h"
 
 extern int debuglevel;
 extern int intrmode;
@@ -37,12 +38,15 @@ static uint32_t ustack[1024];       // user stack
 static uint32_t sstack[1024];       // supervisor stack
 static struct pt_regs target_regs;  // デバッグ対象アプリのレジスタ
 static struct dos_psp *target_psp;  // デバッグ対象アプリのプロセス管理ポインタ
-volatile uint8_t intarget = false;  // デバッグ対象アプリを実行中か
+static volatile uint8_t intarget = false; // デバッグ対象アプリを実行中か
+
+int current_tid = -1;               // 現在実行中のスレッドID
+pthread_internal_t *main_pi = NULL; // マルチスレッドアプリの場合のメインスレッド内部構造体
 
 /* gdbserver本体のコンテキスト */
 
-static uint32_t gdb_sstack[256];    // デバッグ対象から見た親プロセスのスタック
-                                    // (デバッグ対象がexitしてからgdbserverに戻るまでに使用)
+static uint32_t gdb_ustack[256];    // デバッグ対象から見た親プロセスのuser stack
+static uint32_t gdb_sstack[256];    // 〃 supervisor stack (デバッグ対象がexitしてからgdbserverに戻るまでに使用)
 static uint32_t gdb_regs[16];       // gdbserverのレジスタ (デバッグ対象から戻るために使用)
 static struct dos_psp *gdb_psp;     // gdbserverのプロセス管理ポインタ
 static int gdb_breakck;             // 設定変更前のブレークチェックフラグ
@@ -131,6 +135,15 @@ static void common_exit(void)
   );
 }
 
+/* メイン以外のスレッド終了処理 */
+/* 実際の終了はメインスレッドが行うのでそれまでスリープする */
+static void thread_exit(void)
+{
+  while (1) {
+    _dos_change_pr();
+  }
+}
+
 /* デバッグ対象アプリの例外ベクタ初期化 */
 static void init_vector(void)
 {
@@ -176,6 +189,96 @@ static void flash_icache(void)
       "trap #15\n"
       : : : "%%d0", "%%d1"
     );
+  }
+}
+
+/****************************************************************************/
+
+/* スレッドを一時停止させる際の状態保存用 */
+static struct {
+  unsigned char wait_flg;   // スレッドが待ち状態かどうか
+  unsigned char counter;    // スケジューリングカウンタ
+  long wait_time;           // 残り待ち時間
+} thread_stat[32];
+
+/* スレッドの停止時に他のスレッドの実行を一時停止する */
+static void suspend_thread(void)
+{
+  if (PRC_TABLE == NULL) {
+    return;   // PROCESS= が有効でない
+  }
+
+  current_tid = get_current_tid();
+  if (main_pi == NULL) {
+    // メインスレッドのpthread内部構造体アドレスを得る
+    for (int i = 0; i <= PRC_COUNT; i++) {
+      struct dos_prcptr *prc = get_prcptr(i);
+      if (prc->buf_ptr == NULL) {
+        continue;   // 指定IDのスレッドはない
+      }
+      pthread_internal_t *pi = (pthread_internal_t *)(prc->buf_ptr);
+      if (pi->magic != PTH_MAGIC) {
+        continue;   // libpthreadで生成したスレッドではない
+      }
+      main_pi = pi->main_pi;
+      break;
+    }
+  }
+
+  // スレッドデバッグ中に他スレッドが動かないようにするため、
+  // 同一プロセス内の自分以外の全スレッドの状態を保存して一時停止する
+  pthread_internal_t *pi;
+  int i = 0;
+  for (pi = main_pi; pi; pi = pi->next, i++) {
+    if (pi->tid == current_tid) {
+      continue;   // 自分自身の状態は変更しない
+    }
+    struct dos_prcptr *prc = get_prcptr(pi->tid);
+    // 状態を保存
+    thread_stat[i].wait_flg = prc->wait_flg;
+    thread_stat[i].counter = prc->counter;
+    thread_stat[i].wait_time = prc->wait_time;
+    // スリープ状態に変更
+    prc->wait_flg = 0xff;
+    prc->wait_time = 0;
+  }
+}
+
+/* スレッドの再開時に他のスレッドの実行を再開する */
+static void resume_thread(void)
+{
+  if (PRC_TABLE == NULL) {
+    return;   // PROCESS= が有効でない
+  }
+
+  pthread_internal_t *pi;
+  int i = 0;
+  for (pi = main_pi; pi; pi = pi->next, i++) {
+    if (pi->tid == current_tid) {
+      continue;   // 自分自身の状態は変更しない
+    }
+    struct dos_prcptr *prc = get_prcptr(pi->tid);
+    // 状態を復元
+    prc->wait_flg = thread_stat[i].wait_flg;
+    prc->counter = thread_stat[i].counter;
+    prc->wait_time = thread_stat[i].wait_time;
+  }
+}
+
+/* デバッグを終了させるためメインスレッドを実行状態、他スレッドを待ち状態に設定 */
+static void set_thread_terminate(void)
+{
+  if (PRC_TABLE == NULL) {
+    return;   // PROCESS= が有効でない
+  }
+
+  pthread_internal_t *pi;
+  unsigned char new_wait_flg = 0x00;  // メインスレッドは待ち状態でない
+  for (pi = main_pi; pi; pi = pi->next) {
+    struct dos_prcptr *prc = get_prcptr(pi->tid);
+    prc->wait_flg = new_wait_flg;
+    prc->wait_time = 0;
+    new_wait_flg = 0xff;  // 他のスレッドは待ち状態
   }
 }
 
@@ -566,31 +669,91 @@ int ptrace(int request, int pid, void *addr, void *data)
     case PTRACE_GETREGS:
       /* デバッグ対象アプリのレジスタ値をdataにコピーする
        */
-      update_sp();
-      memcpy(data, &target_regs, sizeof(target_regs));
+      if (current_tid < 0 || pid == current_tid) {
+        // 対象が現在実行中のスレッドならgdbserverが保存したレジスタ値を返す
+        update_sp();
+        memcpy(data, &target_regs, sizeof(target_regs));
+      } else {
+        // 他のスレッドならスレッド管理構造体から値を得る
+        struct dos_prcptr *prc = get_prcptr(pid);
+        struct pt_regs *dest = data;
+        memcpy(dest->d, prc->d_reg, sizeof(prc->d_reg));
+        memcpy(dest->a, prc->a_reg, sizeof(prc->a_reg));
+        dest->sr = prc->sr_reg;
+        dest->pc = prc->pc_reg;
+        dest->usp = prc->usp_reg;
+        dest->ssp = prc->ssp_reg;
+        dest->a[7] = dest->sr & 0x2000 ? dest->ssp : dest->usp;
+      }
       break;
 
     case PTRACE_SETREGS:
       /* dataをデバッグ対象アプリのレジスタ値として設定する
        */
       struct pt_regs *newregs = data;
-      for (int i = 0; i < 8; i++) {
-        target_regs.d[i] = newregs->d[i];
-        target_regs.a[i] = newregs->a[i];
+      if (current_tid < 0 || pid == current_tid) {
+        // 対象が現在実行中のスレッドならgdbserverが保存したレジスタ値を変更する
+        for (int i = 0; i < 8; i++) {
+          target_regs.d[i] = newregs->d[i];
+          target_regs.a[i] = newregs->a[i];
+        }
+        target_regs.sr = newregs->sr;
+        target_regs.pc = newregs->pc;
+        retrieve_sp();
+      } else {
+        // 他のスレッドならスレッド管理構造体の値を変更する
+        struct dos_prcptr *prc = get_prcptr(pid);
+        memcpy(prc->d_reg, newregs->d, sizeof(prc->d_reg));
+        memcpy(prc->a_reg, newregs->a, sizeof(prc->a_reg));
+        prc->sr_reg = newregs->sr;
+        prc->pc_reg = newregs->pc;
+        prc->usp_reg = newregs->usp;
+        prc->ssp_reg = newregs->ssp;
       }
-      target_regs.sr = newregs->sr;
-      target_regs.pc = newregs->pc;
-      retrieve_sp();
       break;
 
     case PTRACE_KILL:
       /* デバッグ対象アプリを終了させる
-       * (PCをDOS _EXITに設定して実行再開)
        */
-      target_regs.pc = *(uint32_t *)0x1800;         // DOS _EXIT
-      target_regs.ssp = (uint32_t)target_psp->ssp;
-      target_regs.sr = 0x2000;
-      request = PTRACE_CONT;
+      if (main_pi == NULL) {
+        // バックグラウンドプロセスがない場合
+        // PCをDOS _EXITに設定して実行を再開する
+        target_regs.pc = *(uint32_t *)0x1800;         // DOS _EXIT
+        target_regs.ssp = (uint32_t)target_psp->ssp;
+        target_regs.sr = 0x2000;
+      } else {
+        // バックグラウンドプロセスがある場合
+        // メインスレッドのPCをDOS _EXITに設定、それ以外のスレッドはスリープする
+        pthread_internal_t *pi;
+        // メインスレッドに設定する値
+        uint32_t new_pc = *(uint32_t *)0x1800;        // DOS _EXIT
+        uint32_t new_ssp = (uint32_t)target_psp->ssp;
+
+      __asm__ ("ori.w #0x0700,%sr");
+        for (pi = main_pi; pi; pi = pi->next) {
+          struct dos_prcptr *prc = get_prcptr(pi->tid);
+          if (pi->tid == current_tid) {
+            // 現在実行中のスレッドの場合 gdbserverが保存したレジスタ値を変更する
+            target_regs.pc = new_pc;
+            target_regs.sr = 0x2000;
+            if (new_ssp) {
+              target_regs.ssp = new_ssp;
+            }
+          } else {
+            // 現在実行中のスレッドでない場合 スレッド管理構造体の値を変更する
+            prc->pc_reg = new_pc;
+            prc->sr_reg = 0x2000;
+            if (new_ssp) {
+              prc->ssp_reg = new_ssp;
+            }
+          }
+
+          // メインスレッド以外の設定
+          new_pc = (uint32_t)thread_exit; // DOS _CHANGE_PRを実行し続ける
+          new_ssp = 0;
+        }
+        set_thread_terminate();
+      }
       /* fall through */
 
     case PTRACE_CONT:
@@ -603,13 +766,17 @@ int ptrace(int request, int pid, void *addr, void *data)
        *              *addr: 終了コード
        */
       flash_icache();
-      _dos_breakck(gdb_breakck);
+      if (request != PTRACE_KILL) {
+        _dos_breakck(gdb_breakck);
+      }
       __asm__ ("ori.w #0x0700,%sr");
+      resume_thread();
       set_sccrx_vector();
       intarget = true;
-      result = (request == PTRACE_CONT) ? do_cont() : do_singlestep();
+      result = (request != PTRACE_SINGLESTEP) ? do_cont() : do_singlestep();
       intarget = false;
       restore_sccrx_vector();
+      suspend_thread();
       _dos_breakck(2);
 
       if (result >= 0) {     // デバッグ対象の実行が中断された
@@ -675,8 +842,10 @@ int target_load(const char *name, struct dos_comline *cmdline, const char *env)
     target_psp->exit = common_exit;
     target_psp->ctrlc = common_exit;
     target_psp->errexit = common_exit;
+    target_psp->usp = (void *)gdb_ustack + sizeof(gdb_ustack);
     target_psp->ssp = (void *)gdb_sstack + sizeof(gdb_sstack);
-    target_psp->abort_sr = target_psp->sr;
+    target_psp->sr = 0x0000;
+    target_psp->abort_sr = 0x0000;
 
     /* 例外ベクタを設定してプロセス管理ポインタをデバッグ対象に切り替え */
     _dos_setpdb(target_psp);
